@@ -1,0 +1,762 @@
+name: production-release-controller
+run-name: Driver release ${{ inputs.tag }} ${{ inputs.source_sha }} ${{ inputs.mode }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Exact existing private vMAJOR.MINOR.PATCH tag
+        required: true
+        type: string
+      source_sha:
+        description: Exact 40-character private main commit
+        required: true
+        type: string
+      mode:
+        description: Verified build or immutable release and optional moderation submission
+        required: true
+        type: choice
+        options:
+          - build-only
+          - publish
+          - rustore-publish
+      confirmation:
+        description: Exact PUBLISH ru.altparking.driver followed by the saved RuStore version ID
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # Every tag/SHA/mode shares Driver history and RuStore mutation state.
+  # Keep validation and publication under one lock to prevent stale history.
+  group: driver-release-mutations
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ inputs.tag }}
+  SOURCE_SHA: ${{ inputs.source_sha }}
+  RELEASE_MODE: ${{ inputs.mode }}
+
+jobs:
+  immutable-policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: production
+    permissions: {}
+    steps:
+      # Bootstrap: a fine-grained token for this public repository only, with
+      # Administration: read. The built-in token cannot read this setting.
+      - name: Require GitHub immutable releases
+        shell: python {0}
+        env:
+          CONTROLLER_ADMIN_READ_TOKEN: ${{ secrets.CONTROLLER_ADMIN_READ_TOKEN }}
+        run: |
+          import json
+          import os
+          import re
+          import subprocess
+          try:
+              token = os.environ['CONTROLLER_ADMIN_READ_TOKEN']
+              if re.fullmatch(r'[A-Za-z0-9_]+', token) is None:
+                  raise ValueError('Invalid credential')
+              response = subprocess.run(
+                  ['curl', '--silent', '--show-error', '--config', '-', '--request', 'GET',
+                   '--header', 'Accept: application/vnd.github+json', '--header',
+                   'X-GitHub-Api-Version: 2026-03-10', '--write-out', '\n%{http_code}',
+                   'https://api.github.com/repos/tikhonmoskvin039/alt-parking-driver-releases/immutable-releases'],
+                  input=f'header = "Authorization: Bearer {token}"\n'.encode(),
+                  capture_output=True, timeout=60, check=False,
+              )
+              body, status = response.stdout.rsplit(b'\n', 1)
+              if response.returncode != 0 or status != b'200' or json.loads(body).get('enabled') is not True:
+                  raise ValueError('Immutable releases are not enabled')
+          except Exception:
+              raise SystemExit('Immutable release policy check failed; publication is blocked') from None
+
+  build:
+    if: ${{ inputs.mode == 'build-only' || inputs.mode == 'publish' }}
+    needs: immutable-policy
+    runs-on: windows-latest
+    timeout-minutes: 60
+    environment: production
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      rustore_enabled: ${{ steps.provenance.outputs.rustore_enabled }}
+    steps:
+      - name: Check out public controller
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          persist-credentials: false
+
+      - name: Check out exact private source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: tikhonmoskvin039/mobile-driver-frontend
+          ref: ${{ inputs.source_sha }}
+          token: ${{ secrets.SOURCE_REPO_READ_TOKEN }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+
+      # This dependency-free policy is copied from the running workflow, never
+      # taken from a build artifact. The fresh publisher extracts the same block.
+      - name: Prepare controller policy
+        shell: python {0}
+        run: |
+          # BEGIN DRIVER POLICY
+          import base64
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import shutil
+          import subprocess
+          import sys
+
+          PUBLIC = "tikhonmoskvin039/alt-parking-driver-releases"
+          PRIVATE = "tikhonmoskvin039/mobile-driver-frontend"
+          SIGNER = "E0BEBA119BAA0F69D988495744D3BE2F531AC729656B1B4A05560B2EEB0CE414"
+          CONFIG_KEYS = (
+              "APP_ENV", "API_BASE_URL", "WS_BASE_URL", "FIREBASE_API_KEY", "FIREBASE_APP_ID",
+              "FIREBASE_MESSAGING_SENDER_ID", "FIREBASE_PROJECT_ID", "YANDEX_MAPKIT_API_KEY",
+              "MAP_FALLBACK_LATITUDE", "MAP_FALLBACK_LONGITUDE", "SUPPORT_PHONE", "OAUTH_RETURN_URI",
+          )
+
+          def require(ok, message):
+              if not ok:
+                  raise RuntimeError(message)
+
+          def validate_inputs(tag, sha, mode, flag, attempt):
+              require(re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", tag), "Invalid tag")
+              require(re.fullmatch(r"[0-9a-f]{40}", sha), "Invalid source SHA")
+              require(mode in ("build-only", "publish"), "Invalid release mode")
+              require(flag in ("true", "false"), "Delivery flag must be exactly true or false")
+              require(attempt == "1", "Rerun forbidden; reconcile the previous attempt")
+              return mode == "publish" and flag == "true"
+
+          def canonical_files():
+              names = ("release_metadata", "release_state", "java_properties", "rustore_api", "rustore_release")
+              files = {"tool/" + name + suffix + ".py": "tool/" + name + suffix + ".py"
+                       for name in names for suffix in ("", "_test")}
+              files["tool/production_release_workflow_test.py"] = "tool/production_release_workflow_test.py"
+              files[".github/workflows/release.yml"] = "distribution/github/workflows/release.yml"
+              return files
+
+          def verify_parity(controller, source):
+              for public, private in canonical_files().items():
+                  require((controller / public).read_bytes() == (source / private).read_bytes(), "Controller canonical copy mismatch")
+
+          def run(argv, *, cwd=None, data=None, token=None):
+              environment = os.environ.copy()
+              if token is not None:
+                  environment["GH_TOKEN"] = token
+              result = subprocess.run(argv, cwd=cwd, input=data, capture_output=True, env=environment, timeout=180)
+              require(result.returncode == 0, "Release command failed; no automatic retry")
+              return result.stdout
+
+          def api(endpoint, *, method="GET", payload=None, token=None, binary=False):
+              args = ["gh", "api", "--include", "--method", method, endpoint, "-H", "X-GitHub-Api-Version: 2026-03-10",
+                      "-H", "Accept: application/octet-stream" if binary else "Accept: application/vnd.github+json"]
+              data = None
+              if payload is not None:
+                  args += ["--input", "-"]
+                  data = json.dumps(payload).encode()
+              raw = run(args, data=data, token=token)
+              parts = re.split(br"\r?\n\r?\n", raw, maxsplit=1)
+              status = re.match(br"HTTP/[0-9.]+ ([0-9]{3})(?: |\r?\n)", parts[0])
+              expected = 201 if method == "POST" else 200
+              require(len(parts) == 2 and status is not None and int(status[1]) == expected, "Unexpected GitHub HTTP status")
+              return parts[1] if binary else json.loads(parts[1])
+
+          def pages(endpoint, key=None, token=None):
+              result = []
+              total = None
+              seen_ids = set()
+              for page in range(1, 1001):
+                  response = api(endpoint + ("&" if "?" in endpoint else "?") + f"per_page=100&page={page}", token=token)
+                  if key is not None:
+                      require(key in ("workflow_runs", "jobs") and isinstance(response, dict) and set(response) == {"total_count", key}, "Invalid keyed API page")
+                      count = response["total_count"]
+                      require(type(count) is int and count >= 0, "Invalid API total count")
+                      require(total is None or count == total, "API total count changed during pagination")
+                      total = count
+                      # Every workflow-run caller uses a filtered search. GitHub
+                      # caps these at 1,000 results; equality cannot prove absence
+                      # of older attempts, so stop before any release mutation.
+                      require(key != "workflow_runs" or total < 1000, "Workflow history reached the search ceiling; operator reconciliation required")
+                      values = response[key]
+                  else:
+                      values = response
+                  require(isinstance(values, list) and len(values) <= 100, "Invalid API pagination")
+                  if key is not None:
+                      for value in values:
+                          require(isinstance(value, dict) and type(value.get("id")) is int and value["id"] > 0 and value["id"] not in seen_ids, "Invalid or duplicate paginated row")
+                          seen_ids.add(value["id"])
+                  result.extend(values)
+                  require(total is None or len(result) <= total, "API returned more rows than its total")
+                  if len(values) < 100:
+                      require(total is None or len(result) == total, "API pagination ended before its total")
+                      return result
+              raise RuntimeError("API pagination limit exceeded")
+
+          def select_ci(runs, jobs, sha):
+              candidates = [r for r in runs if r.get("head_sha") == sha and r.get("head_branch") == "main" and r.get("event") == "push"]
+              require(bool(candidates), "No private main push CI")
+              latest = max(candidates, key=lambda r: r["id"])
+              require(latest.get("name") == "CI" and latest.get("status") == "completed" and latest.get("conclusion") == "success", "Latest private CI did not pass")
+              foundation = [j for j in jobs if j.get("name") == "foundation"]
+              require(len(foundation) == 1 and foundation[0].get("head_sha") == sha and foundation[0].get("status") == "completed" and foundation[0].get("conclusion") == "success", "Required foundation job did not pass")
+              return latest["id"]
+
+          def asset_names(tag):
+              return [f"ALT-PARKING-Driver-{tag}.apk", "release-manifest.json", "rustore-submission.json", "SHA256SUMS.txt"]
+
+          def require_absent_public_tag(tag):
+              refs = api(f"repos/{PUBLIC}/git/matching-refs/tags/{tag}")
+              require(isinstance(refs, list) and all(isinstance(ref, dict) and isinstance(ref.get("ref"), str) for ref in refs), "Invalid public refs")
+              require(not any(ref["ref"] == "refs/tags/" + tag for ref in refs), "Public tag already exists")
+
+          def validate_history(releases, tag):
+              from tool.release_state import select_release_state
+              require(select_release_state(tag, [releases], expected_assets=asset_names(tag)) == "absent", "Current release must be absent")
+              tags = set()
+              for release in releases:
+                  previous_tag = release["tag_name"]
+                  require(previous_tag not in tags, "Duplicate release tag")
+                  tags.add(previous_tag)
+                  require(re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", previous_tag), "Unexpected prior tag")
+                  require(release.get("immutable") is True, "Previous release is not immutable")
+                  require(select_release_state(previous_tag, [releases], expected_assets=asset_names(previous_tag)) == "published", "Unsafe previous release")
+              return releases
+
+          def checksums(raw, tag):
+              lines = raw.decode("ascii").splitlines()
+              names = asset_names(tag)[:-1]
+              require(len(lines) == len(names), "Unexpected checksum count")
+              result = {}
+              for line, name in zip(lines, names):
+                  require(re.fullmatch(r"[0-9a-f]{64}  " + re.escape(name), line), "Invalid checksum list")
+                  result[name] = line[:64]
+              return result
+
+          def download_asset(release, name):
+              selected = [a for a in release["assets"] if a["name"] == name]
+              require(len(selected) == 1, "Ambiguous remote asset")
+              return api(f"repos/{PUBLIC}/releases/assets/{selected[0]['id']}", binary=True)
+
+          def previous_manifest(releases, temp):
+              from tool.rustore_release import ReleaseManifest
+              selected = None
+              seen_codes = set()
+              for release in releases:
+                  raw = download_asset(release, "release-manifest.json")
+                  sums = checksums(download_asset(release, "SHA256SUMS.txt"), release["tag_name"])
+                  require(hashlib.sha256(raw).hexdigest() == sums["release-manifest.json"], "Previous manifest checksum mismatch")
+                  path = temp / "candidate-manifest.json"
+                  path.write_bytes(raw)
+                  manifest = ReleaseManifest.from_path(path)
+                  require(manifest.source_tag == release["tag_name"] and manifest.version_code not in seen_codes, "Previous manifest identity conflict")
+                  seen_codes.add(manifest.version_code)
+                  if selected is None or manifest.version_code > selected[0]:
+                      selected = (manifest.version_code, raw)
+              if selected is None:
+                  # Reached only after exhaustive authenticated release enumeration.
+                  (temp / "first-release").write_text("NO_PREVIOUS_RELEASE", encoding="ascii")
+                  return None
+              path = temp / "previous-release-manifest.json"
+              path.write_bytes(selected[1])
+              return path
+
+          def disabled_receipt(manifest):
+              return json.dumps({**manifest, "status": "DISABLED", "publishable": False}, sort_keys=True, separators=(",", ":")).encode()
+
+          def write_checksums(root, tag):
+              raw = "".join(hashlib.sha256((root / name).read_bytes()).hexdigest() + "  " + name + "\n" for name in asset_names(tag)[:-1])
+              (root / "SHA256SUMS.txt").write_bytes(raw.encode("ascii"))
+
+          def verify_bundle(root, tag, sha, enabled):
+              from tool.rustore_release import ReleaseManifest, load_receipt, SUBMITTED
+              require(sorted(p.name for p in root.iterdir()) == sorted(asset_names(tag)), "Unexpected bundle entries")
+              require(all(p.is_file() and not p.is_symlink() for p in root.iterdir()), "Unsafe bundle file")
+              sums = checksums((root / "SHA256SUMS.txt").read_bytes(), tag)
+              for name, digest in sums.items():
+                  require(hashlib.sha256((root / name).read_bytes()).hexdigest() == digest, "Bundle checksum mismatch")
+              manifest = ReleaseManifest.from_path(root / "release-manifest.json")
+              require(manifest.source_tag == tag and manifest.source_commit == sha, "Bundle source mismatch")
+              require(manifest.apk_sha256 == sums[asset_names(tag)[0]], "APK manifest mismatch")
+              if enabled:
+                  receipt = load_receipt(root / "rustore-submission.json", sums["rustore-submission.json"], manifest)
+                  require(receipt.status in SUBMITTED, "Submission is unresolved")
+              else:
+                  require((root / "rustore-submission.json").read_bytes() == disabled_receipt(json.loads((root / "release-manifest.json").read_bytes())), "Disabled receipt mismatch")
+              return manifest
+
+          def validate_apk_identity(badging, certs, version, code):
+              packages = re.findall(r"^package: name='([^']+)' versionCode='([^']+)' versionName='([^']+)'", badging, re.MULTILINE)
+              require(packages == [("ru.altparking.driver", str(code), version)], "APK identity mismatch")
+              signers = re.findall(r"^Signer #\d+ certificate SHA-256 digest: ([0-9a-fA-F]{64})\s*$", certs, re.MULTILINE)
+              require(len(signers) == 1 and signers[0].upper() == SIGNER, "APK signer mismatch")
+
+          def manual_inputs(tag, sha):
+              require(re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", tag), "Invalid tag")
+              require(re.fullmatch(r"[0-9a-f]{40}", sha), "Invalid source SHA")
+              require(os.environ["GITHUB_RUN_ATTEMPT"] == "1", "Manual publication requires its first run attempt")
+              require(os.environ["GITHUB_REPOSITORY"] == PUBLIC and os.environ["GITHUB_REF"] == "refs/heads/main", "Wrong publication controller")
+
+          def publication_receipt(bundle, tag, sha, confirmation):
+              from tool.rustore_release import load_receipt
+              manifest = verify_bundle(bundle, tag, sha, True)
+              digest = checksums((bundle / "SHA256SUMS.txt").read_bytes(), tag)["rustore-submission.json"]
+              receipt = load_receipt(bundle / "rustore-submission.json", digest, manifest)
+              require(confirmation == f"PUBLISH ru.altparking.driver {receipt.rustore_version_id}", "Exact publication confirmation required")
+              return manifest, receipt, digest
+
+          def manual_preflight(temp, tag, sha, confirmation):
+              manual_inputs(tag, sha)
+              require(re.fullmatch(r"[1-9][0-9]*", os.environ["GITHUB_RUN_ID"]), "Invalid workflow run identity")
+              current_id = int(os.environ["GITHUB_RUN_ID"])
+              title = f"Driver release {tag} {sha} rustore-publish"
+              attempts = pages(f"repos/{PUBLIC}/actions/workflows/release.yml/runs?event=workflow_dispatch", "workflow_runs")
+              require(all(isinstance(r, dict) and type(r.get("id")) is int and r["id"] > 0 and isinstance(r.get("display_title"), str) for r in attempts), "Invalid dispatch history")
+              require(sum(r["id"] == current_id and r["display_title"] == title for r in attempts) == 1, "Current dispatch is unproven")
+              require(not any(r["id"] < current_id and r["display_title"] == title for r in attempts), "Earlier publication attempt exists; operator reconciliation required")
+              release = api(f"repos/{PUBLIC}/releases/tags/{tag}")
+              from tool.release_state import select_release_state
+              require(select_release_state(tag, [[release]], expected_assets=asset_names(tag)) == "published", "Exact published release required")
+              require(release.get("immutable") is True, "Release is not immutable")
+              bundle = temp / "assets"
+              bundle.mkdir(exist_ok=False)
+              for name in asset_names(tag):
+                  with (bundle / name).open("xb") as stream:
+                      stream.write(download_asset(release, name))
+              _, receipt, digest = publication_receipt(bundle, tag, sha, confirmation)
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  output.write(f"receipt_sha256={digest}\nrustore_version_id={receipt.rustore_version_id}\n")
+
+          def manual_publish(workspace, temp, tag, sha, confirmation):
+              from tool.rustore_release import load_receipt
+              bundle = temp / "assets"
+              manifest, saved, digest = publication_receipt(bundle, tag, sha, confirmation)
+              require(digest == os.environ["RECEIPT_SHA256"], "Preflight receipt changed")
+              destination = temp / "rustore-publication.json"
+              # The CLI demands exact READY_FOR_PUBLICATION, journals intent,
+              # sends one publish POST and requires a saved-ID ACTIVE read.
+              run([sys.executable, "-m", "tool.rustore_release", "publish", "--manifest", str(bundle / "release-manifest.json"),
+                   "--apk", str(bundle / asset_names(tag)[0]), "--receipt", str(bundle / "rustore-submission.json"),
+                   "--receipt-sha256", digest, "--confirmation", confirmation, "--output", str(destination)], cwd=workspace / "controller")
+              active = load_receipt(destination, hashlib.sha256(destination.read_bytes()).hexdigest(), manifest)
+              require(active.rustore_version_id == saved.rustore_version_id and active.status == "ACTIVE", "Publication not confirmed ACTIVE; operator reconciliation required")
+              print(f"RuStore version {active.rustore_version_id}: ACTIVE")
+
+          def production_config(environment):
+              require(all(isinstance(environment.get(key), str) and environment[key].strip() for key in CONFIG_KEYS), "Missing production configuration")
+              return {key: environment[key] for key in CONFIG_KEYS}
+
+          def provenance(workspace, temp, tag, sha, enabled):
+              require(os.environ["GITHUB_REPOSITORY"] == PUBLIC and os.environ["GITHUB_REF"] == "refs/heads/main", "Wrong controller repository or ref")
+              source, controller = workspace / "source", workspace / "controller"
+              require(run(["git", "rev-parse", "HEAD"], cwd=source).decode().strip() == sha, "Source HEAD mismatch")
+              run(["git", "merge-base", "--is-ancestor", sha, "refs/remotes/origin/main"], cwd=source)
+              require(run(["git", "rev-parse", f"refs/tags/{tag}^{{commit}}"], cwd=source).decode().strip() == sha, "Private tag mismatch")
+              verify_parity(controller, source)
+              token = os.environ["SOURCE_REPO_READ_TOKEN"]
+              runs = pages(f"repos/{PRIVATE}/actions/workflows/ci.yml/runs?event=push&branch=main&head_sha={sha}", "workflow_runs", token)
+              require(bool(runs), "No private CI runs")
+              latest = max(runs, key=lambda r: r["id"])
+              jobs = pages(f"repos/{PRIVATE}/actions/runs/{latest['id']}/jobs?filter=latest", "jobs", token)
+              select_ci(runs, jobs, sha)
+              title = f"Driver release {tag} {sha} {os.environ['RELEASE_MODE']}"
+              attempts = pages(f"repos/{PUBLIC}/actions/workflows/release.yml/runs?event=workflow_dispatch", "workflow_runs")
+              require(not any(r.get("display_title") == title and str(r["id"]) != os.environ["GITHUB_RUN_ID"] for r in attempts), "Earlier dispatch exists; operator reconciliation required")
+              require_absent_public_tag(tag)
+              releases = validate_history(pages(f"repos/{PUBLIC}/releases"), tag)
+              previous = previous_manifest(releases, temp)
+              from tool.release_metadata import validate_release
+              validate_release(tag, (source / "pubspec.yaml").read_text(encoding="utf-8"), previous.read_text(encoding="utf-8") if previous else None)
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  output.write("rustore_enabled=" + str(enabled).lower() + "\n")
+
+          def configure(workspace, temp):
+              source = workspace / "source"
+              config = source / ".env.driver-prod.json"
+              run(["git", "check-ignore", "--quiet", str(config)], cwd=source)
+              key = temp / "driver-production.jks"
+              with key.open("xb") as stream:
+                  stream.write(base64.b64decode(os.environ["ANDROID_KEYSTORE_BASE64"], validate=True))
+              require(key.stat().st_size > 0, "Empty keystore")
+              os.environ["KEYSTORE_PATH"] = str(key)
+              run([sys.executable, "-m", "tool.java_properties", "android-signing", "--output", str(source / "android/key.properties")], cwd=workspace / "controller")
+              with config.open("x", encoding="utf-8") as stream:
+                  json.dump(production_config(os.environ), stream)
+
+          def verify_apk(workspace, temp, tag, sha):
+              from tool.release_metadata import validate_release
+              source = workspace / "source"
+              previous = temp / "previous-release-manifest.json"
+              metadata = validate_release(tag, (source / "pubspec.yaml").read_text(encoding="utf-8"), previous.read_text(encoding="utf-8") if previous.exists() else None)
+              tools = [p for p in (Path(os.environ["ANDROID_HOME"]) / "build-tools").iterdir() if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", p.name)]
+              require(bool(tools), "Android build tools unavailable")
+              tools = max(tools, key=lambda p: tuple(map(int, p.name.split("."))))
+              apk = source / "build/app/outputs/flutter-apk/app-prod-release.apk"
+              badging = run([str(tools / "aapt.exe"), "dump", "badging", str(apk)]).decode()
+              certs = run([str(tools / "apksigner.bat"), "verify", "--verbose", "--print-certs", str(apk)]).decode()
+              validate_apk_identity(badging, certs, metadata.version_name, metadata.build_number)
+              run([str(tools / "zipalign.exe"), "-c", "-v", "4", str(apk)])
+              bundle = temp / "assets"
+              bundle.mkdir()
+              destination = bundle / asset_names(tag)[0]
+              shutil.copyfile(apk, destination)
+              digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+              if previous.exists():
+                  history = ["--previous-manifest", str(previous)]
+              else:
+                  require((temp / "first-release").read_text(encoding="ascii") == "NO_PREVIOUS_RELEASE", "First release is unproven")
+                  history = ["--first-release", "NO_PREVIOUS_RELEASE"]
+              run([sys.executable, "-m", "tool.release_metadata", "manifest", "--tag", tag, "--pubspec", str(source / "pubspec.yaml"),
+                   *history, "--package-id", "ru.altparking.driver", "--source-sha", sha, "--apk-sha256", digest,
+                   "--signing-certificate-sha256", SIGNER, "--output", str(bundle / "release-manifest.json")], cwd=workspace / "controller")
+
+          def finish_bundle(temp, tag, sha, enabled):
+              bundle = temp / "assets"
+              destination = bundle / "rustore-submission.json"
+              if enabled:
+                  # Only a successful CLI can provide this receipt. Its journal
+                  # stays outside the public allowlist and is never published.
+                  shutil.copyfile(temp / "rustore-submission.json", destination)
+              else:
+                  destination.write_bytes(disabled_receipt(json.loads((bundle / "release-manifest.json").read_bytes())))
+              write_checksums(bundle, tag)
+              verify_bundle(bundle, tag, sha, enabled)
+
+          def publish(workspace, temp, tag, sha, enabled):
+              require(os.environ["GITHUB_REPOSITORY"] == PUBLIC and os.environ["GITHUB_REF"] == "refs/heads/main", "Wrong publisher identity")
+              bundle = workspace / "release-assets"
+              candidate = verify_bundle(bundle, tag, sha, enabled)
+              require_absent_public_tag(tag)
+              releases = validate_history(pages(f"repos/{PUBLIC}/releases"), tag)
+              previous = previous_manifest(releases, temp)
+              if previous:
+                  from tool.rustore_release import ReleaseManifest
+                  require(candidate.version_code > ReleaseManifest.from_path(previous).version_code, "Build number no longer increases")
+              # No draft reuse, clobber, retry, delete or release-body secrets.
+              release = api(f"repos/{PUBLIC}/releases", method="POST", payload={"tag_name": tag, "target_commitish": os.environ["GITHUB_SHA"],
+                            "name": "ALT:PARKING Driver " + candidate.version_name, "body": "Verified production APK for ru.altparking.driver.", "draft": True, "prerelease": False})
+              release_id = release["id"]
+              require(type(release_id) is int and release_id > 0 and release.get("draft") is True and release.get("tag_name") == tag and release.get("assets") == [], "Ambiguous draft creation")
+              for name in asset_names(tag):
+                  run(["gh", "api", "--method", "POST", f"https://uploads.github.com/repos/{PUBLIC}/releases/{release_id}/assets?name={name}",
+                       "-H", "Content-Type: application/octet-stream", "--input", str(bundle / name)])
+              remote = api(f"repos/{PUBLIC}/releases/{release_id}")
+              require(remote.get("draft") is True and remote.get("tag_name") == tag and remote.get("id") == release_id, "Draft ownership changed")
+              # Validate the exact remote multiset while allowing only our newly
+              # created draft; select_release_state rejects every preexisting one.
+              from tool.release_state import select_release_state
+              inspected = {**remote, "draft": False}
+              require(select_release_state(tag, [[inspected]], expected_assets=asset_names(tag)) == "published", "Remote asset mismatch")
+              for name in asset_names(tag):
+                  require(download_asset(remote, name) == (bundle / name).read_bytes(), "Uploaded bytes differ")
+              final = api(f"repos/{PUBLIC}/releases/{release_id}", method="PATCH", payload={"draft": False, "make_latest": "true"})
+              require(final.get("draft") is False and final.get("immutable") is True and final.get("tag_name") == tag and final.get("id") == release_id, "Release did not become immutable; operator action required")
+
+          def main():
+              workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+              temp = Path(os.environ["RUNNER_TEMP"]).resolve() / "driver-release"
+              operation = os.environ.get("POLICY_OPERATION", "install")
+              if operation == "install":
+                  temp.mkdir(exist_ok=False)
+                  shutil.copyfile(__file__, temp / "policy.py")
+                  return
+              sys.path.insert(0, str(workspace / "controller"))
+              tag, sha = os.environ["RELEASE_TAG"], os.environ["SOURCE_SHA"]
+              if operation in ("manual-preflight", "manual-publish"):
+                  require(os.environ["RELEASE_MODE"] == "rustore-publish", "Invalid manual mode")
+                  manual_inputs(tag, sha)
+                  confirmation = os.environ["PUBLICATION_CONFIRMATION"]
+                  if operation == "manual-preflight":
+                      manual_preflight(temp, tag, sha, confirmation)
+                  else:
+                      manual_publish(workspace, temp, tag, sha, confirmation)
+                  return
+              enabled = validate_inputs(tag, sha, os.environ["RELEASE_MODE"], os.environ["DELIVERY_FLAG"], os.environ["GITHUB_RUN_ATTEMPT"])
+              if operation == "provenance":
+                  provenance(workspace, temp, tag, sha, enabled)
+              elif operation == "configure":
+                  configure(workspace, temp)
+              elif operation == "verify-apk":
+                  verify_apk(workspace, temp, tag, sha)
+              elif operation == "bundle":
+                  finish_bundle(temp, tag, sha, enabled)
+              elif operation == "publish":
+                  publish(workspace, temp, tag, sha, enabled)
+              else:
+                  raise RuntimeError("Unknown policy operation")
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception:
+                  # Never surface untrusted API, process, or secret-bearing errors.
+                  raise SystemExit("Driver release gate failed; reconcile before any new attempt") from None
+          # END DRIVER POLICY
+
+      - name: Validate provenance history and delivery flag
+        id: provenance
+        shell: pwsh
+        env:
+          POLICY_OPERATION: provenance
+          DELIVERY_FLAG: ${{ vars.RUSTORE_DELIVERY_ENABLED }}
+          SOURCE_REPO_READ_TOKEN: ${{ secrets.SOURCE_REPO_READ_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python "$env:RUNNER_TEMP/driver-release/policy.py"
+          if ($LASTEXITCODE -ne 0) { throw 'Provenance gate failed' }
+
+      - name: Run canonical Python tool contracts
+        working-directory: source
+        shell: pwsh
+        run: |
+          python -m unittest tool.release_metadata_test tool.release_state_test tool.java_properties_test tool.rustore_api_test tool.rustore_release_test tool.production_release_workflow_test -v
+          if ($LASTEXITCODE -ne 0) { throw 'Python tool contracts failed' }
+
+      - uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2
+        with:
+          flutter-version: 3.44.7
+          channel: stable
+          cache: false
+
+      - name: Verify runner OpenSSL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $opensslDirectory = Join-Path $env:ProgramFiles 'Git/usr/bin'
+          $openssl = Join-Path $opensslDirectory 'openssl.exe'
+          if (-not (Test-Path -LiteralPath $openssl -PathType Leaf)) { throw 'Git OpenSSL unavailable' }
+          & $openssl version
+          if ($LASTEXITCODE -ne 0) { throw 'Git OpenSSL version check failed' }
+          $opensslDirectory | Out-File -LiteralPath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Prepare exclusive temporary production configuration and signing
+        shell: pwsh
+        env:
+          POLICY_OPERATION: configure
+          DELIVERY_FLAG: ${{ vars.RUSTORE_DELIVERY_ENABLED }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          FIREBASE_API_KEY: ${{ secrets.FIREBASE_API_KEY }}
+          YANDEX_MAPKIT_API_KEY: ${{ secrets.YANDEX_MAPKIT_API_KEY }}
+          APP_ENV: ${{ vars.APP_ENV }}
+          API_BASE_URL: ${{ vars.API_BASE_URL }}
+          WS_BASE_URL: ${{ vars.WS_BASE_URL }}
+          FIREBASE_APP_ID: ${{ vars.FIREBASE_APP_ID }}
+          FIREBASE_MESSAGING_SENDER_ID: ${{ vars.FIREBASE_MESSAGING_SENDER_ID }}
+          FIREBASE_PROJECT_ID: ${{ vars.FIREBASE_PROJECT_ID }}
+          MAP_FALLBACK_LATITUDE: ${{ vars.MAP_FALLBACK_LATITUDE }}
+          MAP_FALLBACK_LONGITUDE: ${{ vars.MAP_FALLBACK_LONGITUDE }}
+          SUPPORT_PHONE: ${{ vars.SUPPORT_PHONE }}
+          OAUTH_RETURN_URI: ${{ vars.OAUTH_RETURN_URI }}
+        run: |
+          python "$env:RUNNER_TEMP/driver-release/policy.py"
+          if ($LASTEXITCODE -ne 0) { throw 'Temporary production inputs failed' }
+
+      - name: Build through authoritative production wrapper
+        working-directory: source
+        shell: pwsh
+        run: |
+          pwsh -File tool/build_android_prod_release.ps1 -ConfigPath .env.driver-prod.json
+          if ($LASTEXITCODE -ne 0) { throw 'Production wrapper failed' }
+
+      - name: Verify APK and emit immutable metadata
+        shell: pwsh
+        env:
+          POLICY_OPERATION: verify-apk
+          DELIVERY_FLAG: ${{ vars.RUSTORE_DELIVERY_ENABLED }}
+        run: |
+          python "$env:RUNNER_TEMP/driver-release/policy.py"
+          if ($LASTEXITCODE -ne 0) { throw 'APK verification failed' }
+
+      - name: Submit verified APK to manual RuStore moderation once
+        if: inputs.mode == 'publish' && steps.provenance.outputs.rustore_enabled == 'true'
+        working-directory: controller
+        shell: pwsh
+        env:
+          RUSTORE_SUBMIT_KEY_ID: ${{ secrets.RUSTORE_SUBMIT_KEY_ID }}
+          RUSTORE_SUBMIT_PRIVATE_KEY_PKCS8_BASE64: ${{ secrets.RUSTORE_SUBMIT_PRIVATE_KEY_PKCS8_BASE64 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:TMP = "$env:RUNNER_TEMP/driver-release"
+          $env:TEMP = $env:TMP
+          python -m tool.rustore_release submit --manifest "$env:RUNNER_TEMP/driver-release/assets/release-manifest.json" --apk "$env:RUNNER_TEMP/driver-release/assets/ALT-PARKING-Driver-$env:RELEASE_TAG.apk" --output "$env:RUNNER_TEMP/driver-release/rustore-submission.json" --poll-limit 1
+          if ($LASTEXITCODE -ne 0) { throw 'RuStore submission unresolved; do not retry' }
+
+      - name: Seal exact public bundle
+        shell: pwsh
+        env:
+          POLICY_OPERATION: bundle
+          DELIVERY_FLAG: ${{ vars.RUSTORE_DELIVERY_ENABLED }}
+        run: |
+          python "$env:RUNNER_TEMP/driver-release/policy.py"
+          if ($LASTEXITCODE -ne 0) { throw 'Public bundle validation failed' }
+
+      - name: Upload verified public bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: driver-release-${{ inputs.tag }}-${{ inputs.source_sha }}
+          path: ${{ runner.temp }}/driver-release/assets
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Remove all temporary production material
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Explicit children only; never delete either runner root.
+          $targets = @(
+            @($env:GITHUB_WORKSPACE, 'source'),
+            @($env:GITHUB_WORKSPACE, 'controller'),
+            @($env:RUNNER_TEMP, 'driver-release')
+          )
+          foreach ($entry in $targets) {
+            $root = [IO.Path]::GetFullPath($entry[0]).TrimEnd([IO.Path]::DirectorySeparatorChar)
+            $target = [IO.Path]::GetFullPath((Join-Path $root $entry[1]))
+            if ([IO.Path]::GetDirectoryName($target) -cne $root) { throw 'Cleanup target escaped runner directory' }
+            if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Recurse -Force }
+          }
+
+  publish:
+    if: ${{ inputs.mode == 'publish' }}
+    needs: [immutable-policy, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Check out public controller
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          persist-credentials: false
+
+      - name: Download verified public bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: driver-release-${{ inputs.tag }}-${{ inputs.source_sha }}
+          path: release-assets
+
+      - name: Verify bytes and publish immutable release
+        shell: python {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DELIVERY_FLAG: ${{ needs.build.outputs.rustore_enabled }}
+          POLICY_OPERATION: publish
+        run: |
+          import os
+          from pathlib import Path
+          import textwrap
+          workflow = Path(os.environ['GITHUB_WORKSPACE']) / 'controller/.github/workflows/release.yml'
+          text = workflow.read_text(encoding='utf-8')
+          code = text.split('          # BEGIN DRIVER POLICY\n', 1)[1].split('          # END DRIVER POLICY', 1)[0]
+          temporary = Path(os.environ['RUNNER_TEMP']) / 'driver-release'
+          temporary.mkdir(exist_ok=False)
+          exec(compile(textwrap.dedent(code), str(workflow), 'exec'), {'__name__': '__main__'})
+
+      - name: Remove publisher temporary files
+        if: always()
+        shell: python {0}
+        run: |
+          import os
+          from pathlib import Path
+          import shutil
+          for root, child in ((os.environ['GITHUB_WORKSPACE'], 'controller'),
+                              (os.environ['GITHUB_WORKSPACE'], 'release-assets'),
+                              (os.environ['RUNNER_TEMP'], 'driver-release')):
+              root = Path(root).resolve()
+              target = root / child
+              if target.resolve().parent != root:
+                  raise SystemExit('Cleanup target escaped runner directory')
+              if target.exists():
+                  shutil.rmtree(target)
+
+  rustore-publish:
+    if: ${{ inputs.mode == 'rustore-publish' }}
+    needs: immutable-policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Check out public controller
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          persist-credentials: false
+
+      - name: Validate prior dispatches and exact immutable publication bundle
+        id: preflight
+        shell: python {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          POLICY_OPERATION: manual-preflight
+          PUBLICATION_CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          import os
+          from pathlib import Path
+          import textwrap
+          workflow = Path(os.environ['GITHUB_WORKSPACE']) / 'controller/.github/workflows/release.yml'
+          text = workflow.read_text(encoding='utf-8')
+          code = text.split('          # BEGIN DRIVER POLICY\n', 1)[1].split('          # END DRIVER POLICY', 1)[0]
+          temporary = Path(os.environ['RUNNER_TEMP']) / 'driver-release'
+          temporary.mkdir(exist_ok=False)
+          policy = temporary / 'policy.py'
+          policy.write_text(textwrap.dedent(code), encoding='utf-8')
+          exec(compile(policy.read_text(encoding='utf-8'), str(policy), 'exec'), {'__name__': '__main__'})
+
+      - name: Publish saved RuStore version once and require ACTIVE
+        shell: python {0}
+        env:
+          RUSTORE_PUBLISH_KEY_ID: ${{ secrets.RUSTORE_PUBLISH_KEY_ID }}
+          RUSTORE_PUBLISH_PRIVATE_KEY_PKCS8_BASE64: ${{ secrets.RUSTORE_PUBLISH_PRIVATE_KEY_PKCS8_BASE64 }}
+          POLICY_OPERATION: manual-publish
+          PUBLICATION_CONFIRMATION: ${{ inputs.confirmation }}
+          RECEIPT_SHA256: ${{ steps.preflight.outputs.receipt_sha256 }}
+        run: |
+          import os
+          from pathlib import Path
+          temporary = Path(os.environ['RUNNER_TEMP']) / 'driver-release'
+          os.environ['TMPDIR'] = str(temporary)
+          policy = temporary / 'policy.py'
+          exec(compile(policy.read_text(encoding='utf-8'), str(policy), 'exec'), {'__name__': '__main__'})
+
+      - name: Remove manual publication temporary files
+        if: always()
+        shell: python {0}
+        run: |
+          import os
+          from pathlib import Path
+          import shutil
+          for root, child in ((os.environ['GITHUB_WORKSPACE'], 'controller'),
+                              (os.environ['RUNNER_TEMP'], 'driver-release')):
+              root = Path(root).resolve()
+              target = root / child
+              if target.resolve().parent != root:
+                  raise SystemExit('Cleanup target escaped runner directory')
+              if target.exists():
+                  shutil.rmtree(target)
