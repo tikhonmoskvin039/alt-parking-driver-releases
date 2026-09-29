@@ -79,6 +79,10 @@ class ProductionReleaseWorkflowTest(unittest.TestCase):
         self.assertIn("openssl version", self.workflow)
         self.assertIn("Git/usr/bin", self.workflow)
 
+    def test_windows_build_uses_mapkit_compatible_java(self) -> None:
+        self.assertEqual(self.workflow.count("java-version: '21'"), 1)
+        self.assertNotIn("java-version: '17'", self.workflow)
+
     def test_all_driver_release_mutations_share_one_workflow_lock(self) -> None:
         # History checks and writes must share the lock even when tag, SHA and
         # mode differ: two candidates must never validate against the same tip.
