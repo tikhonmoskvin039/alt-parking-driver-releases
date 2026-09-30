@@ -298,6 +298,15 @@ jobs:
                   require((root / "rustore-submission.json").read_bytes() == disabled_receipt(json.loads((root / "release-manifest.json").read_bytes())), "Disabled receipt mismatch")
               return manifest
 
+          def select_android_build_tools(root):
+              require(root.is_dir(), "Android build tools unavailable")
+              names = ("aapt.exe", "apksigner.bat", "zipalign.exe")
+              tools = [p for p in root.iterdir()
+                       if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", p.name)
+                       and all((p / name).is_file() for name in names)]
+              require(bool(tools), "Complete Android build tools unavailable")
+              return max(tools, key=lambda p: tuple(map(int, p.name.split("."))))
+
           def validate_apk_identity(badging, certs, version, code):
               packages = re.findall(r"^package: name='([^']+)' versionCode='([^']+)' versionName='([^']+)'", badging, re.MULTILINE)
               require(packages == [("ru.altparking.driver", str(code), version)], "APK identity mismatch")
@@ -401,14 +410,18 @@ jobs:
               source = workspace / "source"
               previous = temp / "previous-release-manifest.json"
               metadata = validate_release(tag, (source / "pubspec.yaml").read_text(encoding="utf-8"), previous.read_text(encoding="utf-8") if previous.exists() else None)
-              tools = [p for p in (Path(os.environ["ANDROID_HOME"]) / "build-tools").iterdir() if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", p.name)]
-              require(bool(tools), "Android build tools unavailable")
-              tools = max(tools, key=lambda p: tuple(map(int, p.name.split("."))))
+              print("APK_VERIFY_STAGE=metadata")
+              tools = select_android_build_tools(Path(os.environ["ANDROID_HOME"]) / "build-tools")
+              print("APK_VERIFY_STAGE=toolset")
               apk = source / "build/app/outputs/flutter-apk/app-prod-release.apk"
               badging = run([str(tools / "aapt.exe"), "dump", "badging", str(apk)]).decode()
+              print("APK_VERIFY_STAGE=badging")
               certs = run([str(tools / "apksigner.bat"), "verify", "--verbose", "--print-certs", str(apk)]).decode()
+              print("APK_VERIFY_STAGE=signature")
               validate_apk_identity(badging, certs, metadata.version_name, metadata.build_number)
+              print("APK_VERIFY_STAGE=identity")
               run([str(tools / "zipalign.exe"), "-c", "-v", "4", str(apk)])
+              print("APK_VERIFY_STAGE=alignment")
               bundle = temp / "assets"
               bundle.mkdir()
               destination = bundle / asset_names(tag)[0]
@@ -422,6 +435,7 @@ jobs:
               run([sys.executable, "-m", "tool.release_metadata", "manifest", "--tag", tag, "--pubspec", str(source / "pubspec.yaml"),
                    *history, "--package-id", "ru.altparking.driver", "--source-sha", sha, "--apk-sha256", digest,
                    "--signing-certificate-sha256", SIGNER, "--output", str(bundle / "release-manifest.json")], cwd=workspace / "controller")
+              print("APK_VERIFY_STAGE=manifest")
 
           def finish_bundle(temp, tag, sha, enabled):
               bundle = temp / "assets"

@@ -701,6 +701,46 @@ class ProductionReleaseWorkflowTest(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(RuntimeError):
                 self.call("validate_apk_identity", bad, certificate, "1.2.3", 18)
 
+    def test_apk_gate_selects_latest_complete_android_build_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            complete = root / "36.1.0"
+            incomplete = root / "37.0.0"
+            ignored = root / "37.0.0-preview"
+            for path in (complete, incomplete, ignored):
+                path.mkdir()
+            for name in ("aapt.exe", "apksigner.bat", "zipalign.exe"):
+                (complete / name).write_bytes(b"")
+            for name in ("apksigner.bat", "zipalign.exe"):
+                (incomplete / name).write_bytes(b"")
+
+            self.assertEqual(self.call("select_android_build_tools", root), complete)
+
+            (incomplete / "aapt.exe").write_bytes(b"")
+            self.assertEqual(self.call("select_android_build_tools", root), incomplete)
+
+            for name in ("aapt.exe", "apksigner.bat", "zipalign.exe"):
+                (complete / name).unlink()
+                (incomplete / name).unlink()
+            with self.assertRaises(RuntimeError):
+                self.call("select_android_build_tools", root)
+
+    def test_apk_gate_emits_only_fixed_safe_progress_markers(self) -> None:
+        verify_apk = self.policy_code.split("def verify_apk(", 1)[1].split("\n\ndef finish_bundle", 1)[0]
+        markers = (
+            'print("APK_VERIFY_STAGE=metadata")',
+            'print("APK_VERIFY_STAGE=toolset")',
+            'print("APK_VERIFY_STAGE=badging")',
+            'print("APK_VERIFY_STAGE=signature")',
+            'print("APK_VERIFY_STAGE=identity")',
+            'print("APK_VERIFY_STAGE=alignment")',
+            'print("APK_VERIFY_STAGE=manifest")',
+        )
+        positions = [verify_apk.index(marker) for marker in markers]
+        self.assertEqual(positions, sorted(positions))
+        self.assertNotIn("print(badging)", verify_apk)
+        self.assertNotIn("print(certs)", verify_apk)
+
     def test_production_config_has_exact_keys_and_rejects_empty_without_values(self) -> None:
         keys = {"APP_ENV", "API_BASE_URL", "WS_BASE_URL", "FIREBASE_API_KEY", "FIREBASE_APP_ID",
                 "FIREBASE_MESSAGING_SENDER_ID", "FIREBASE_PROJECT_ID", "YANDEX_MAPKIT_API_KEY",
