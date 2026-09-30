@@ -299,13 +299,16 @@ jobs:
               return manifest
 
           def select_android_build_tools(root):
-              require(root.is_dir(), "Android build tools unavailable")
-              names = ("aapt.exe", "apksigner.bat", "zipalign.exe")
-              tools = [p for p in root.iterdir()
-                       if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", p.name)
-                       and all((p / name).is_file() for name in names)]
-              require(bool(tools), "Complete Android build tools unavailable")
-              return max(tools, key=lambda p: tuple(map(int, p.name.split("."))))
+              tools = root / "36.0.0"
+              required = (tools / "aapt.exe", tools / "zipalign.exe", tools / "lib/apksigner.jar")
+              require(root.is_dir() and tools.is_dir() and all(path.is_file() for path in required),
+                      "Vetted Android build tools unavailable")
+              return tools
+
+          def apksigner_command(tools, apk):
+              java = Path(os.environ["JAVA_HOME"]) / "bin/java.exe"
+              return [str(java), "-jar", str(tools / "lib/apksigner.jar"),
+                      "verify", "--verbose", "--print-certs", str(apk)]
 
           def validate_apk_identity(badging, certs, version, code):
               packages = re.findall(r"^package: name='([^']+)' versionCode='([^']+)' versionName='([^']+)'", badging, re.MULTILINE)
@@ -416,7 +419,11 @@ jobs:
               apk = source / "build/app/outputs/flutter-apk/app-prod-release.apk"
               badging = run([str(tools / "aapt.exe"), "dump", "badging", str(apk)]).decode()
               print("APK_VERIFY_STAGE=badging")
-              certs = run([str(tools / "apksigner.bat"), "verify", "--verbose", "--print-certs", str(apk)]).decode()
+              signer = apksigner_command(tools, apk)
+              require(Path(signer[0]).is_file(), "Java runtime unavailable")
+              run([*signer[:3], "--version"])
+              print("APK_VERIFY_STAGE=signature-tool")
+              certs = run(signer).decode()
               print("APK_VERIFY_STAGE=signature")
               validate_apk_identity(badging, certs, metadata.version_name, metadata.build_number)
               print("APK_VERIFY_STAGE=identity")
