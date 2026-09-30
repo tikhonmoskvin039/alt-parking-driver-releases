@@ -75,12 +75,16 @@ def client(
         signatures.append((message, der_key))
         return b"test-signature"
 
+    def upload(url: str, token: str, apk_path: Path) -> tuple[int, bytes]:
+        return transport("POST", url, {"Public-Token": token}, apk_path.read_bytes())
+
     return RustoreApiClient(
         key_id="driver-submit-key",
         private_key_pkcs8_base64="ZGVyLWtleQ==",
         request=transport,
         sign=sign,
         now=now,
+        upload=upload,
     )
 
 
@@ -293,11 +297,40 @@ class RustoreApiContractTest(unittest.TestCase):
         requests = transport.requests[1:]
         self.assertEqual([item[0] for item in requests], ["POST", "POST", "POST"])
         self.assertEqual(requests[0][1], f"{BASE}/public/v1/application/{PACKAGE}/version/42/apk?isMainApk=true&servicesType=Unknown")
-        self.assertIn(b"fixture-apk", requests[0][3] or b"")
-        self.assertIn(b'name="file"; filename="driver.apk"', requests[0][3] or b"")
-        self.assertTrue(requests[0][2]["Content-Type"].startswith("multipart/form-data; boundary="))
+        self.assertEqual(requests[0][2], {"Public-Token": "test-jwe"})
+        self.assertEqual(requests[0][3], b"PK\x03\x04fixture-apk")
         self.assertEqual(requests[1][1], f"{BASE}/public/v1/application/{PACKAGE}/version/42/commit?priorityUpdate=0")
         self.assertEqual(requests[2][1], f"{BASE}/public/v1/application/{PACKAGE}/version/42/publish")
+
+    def test_default_upload_uses_documented_curl_form_without_materializing_multipart(self) -> None:
+        transport = RecordingTransport(AUTH, (200, b'{"code":"OK"}'))
+        executed: list[tuple[list[str], dict[str, object]]] = []
+
+        def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            executed.append((args, kwargs))
+            return subprocess.CompletedProcess(args, 0, stdout=b'{"code":"OK"}\n200', stderr=b"")
+
+        with tempfile.TemporaryDirectory() as directory:
+            apk = Path(directory) / "driver release.apk"
+            apk.write_bytes(b"PK\x03\x04fixture-apk")
+            api = RustoreApiClient(
+                key_id="driver-submit-key", private_key_pkcs8_base64="ZGVyLWtleQ==",
+                request=transport, sign=lambda message, key: b"test-signature", now=lambda: NOW,
+            )
+            with patch("tool.rustore_api.subprocess.run", side_effect=run), \
+                    patch("pathlib.Path.read_bytes", side_effect=AssertionError("APK must be streamed by curl")):
+                api.upload_main_apk(PACKAGE, 42, apk)
+
+        self.assertEqual(len(executed), 1)
+        command, options = executed[0]
+        self.assertEqual(command[0], "curl")
+        self.assertIn("--form", command)
+        self.assertIn(f"file=@{apk}", command)
+        self.assertIn(f"{BASE}/public/v1/application/{PACKAGE}/version/42/apk?isMainApk=true&servicesType=Unknown", command)
+        self.assertIn("Public-Token: test-jwe", command)
+        self.assertNotIn("Content-Type: application/vnd.android.package-archive", command)
+        self.assertEqual(options["input"], None)
+        self.assertEqual(transport.requests[1:], [])
 
     def test_acknowledgement_endpoints_accept_only_absent_or_null_body(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
