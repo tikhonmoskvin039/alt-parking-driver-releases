@@ -701,29 +701,40 @@ class ProductionReleaseWorkflowTest(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(RuntimeError):
                 self.call("validate_apk_identity", bad, certificate, "1.2.3", 18)
 
-    def test_apk_gate_selects_latest_complete_android_build_tools(self) -> None:
+    def test_apk_gate_pins_vetted_android_build_tools_and_full_apksigner(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            complete = root / "36.1.0"
-            incomplete = root / "37.0.0"
-            ignored = root / "37.0.0-preview"
-            for path in (complete, incomplete, ignored):
+            vetted = root / "36.0.0"
+            newer = root / "37.0.0"
+            for path in (vetted, newer):
                 path.mkdir()
-            for name in ("aapt.exe", "apksigner.bat", "zipalign.exe"):
-                (complete / name).write_bytes(b"")
-            for name in ("apksigner.bat", "zipalign.exe"):
-                (incomplete / name).write_bytes(b"")
+                (path / "lib").mkdir()
+                for name in ("aapt.exe", "zipalign.exe"):
+                    (path / name).write_bytes(b"")
+                (path / "lib/apksigner.jar").write_bytes(b"")
 
-            self.assertEqual(self.call("select_android_build_tools", root), complete)
+            self.assertEqual(self.call("select_android_build_tools", root), vetted)
 
-            (incomplete / "aapt.exe").write_bytes(b"")
-            self.assertEqual(self.call("select_android_build_tools", root), incomplete)
-
-            for name in ("aapt.exe", "apksigner.bat", "zipalign.exe"):
-                (complete / name).unlink()
-                (incomplete / name).unlink()
+            (vetted / "lib/apksigner.jar").unlink()
             with self.assertRaises(RuntimeError):
                 self.call("select_android_build_tools", root)
+
+    def test_apk_gate_invokes_pinned_apksigner_jar_directly(self) -> None:
+        tools = Path("C:/Android/build-tools/36.0.0")
+        apk = Path("C:/release/driver.apk")
+        with patch.dict(os.environ, {"JAVA_HOME": "C:/Java"}):
+            self.assertEqual(
+                self.call("apksigner_command", tools, apk),
+                [
+                    "C:\\Java\\bin\\java.exe",
+                    "-jar",
+                    "C:\\Android\\build-tools\\36.0.0\\lib\\apksigner.jar",
+                    "verify",
+                    "--verbose",
+                    "--print-certs",
+                    "C:\\release\\driver.apk",
+                ],
+            )
 
     def test_apk_gate_emits_only_fixed_safe_progress_markers(self) -> None:
         verify_apk = self.policy_code.split("def verify_apk(", 1)[1].split("\n\ndef finish_bundle", 1)[0]
@@ -731,6 +742,7 @@ class ProductionReleaseWorkflowTest(unittest.TestCase):
             'print("APK_VERIFY_STAGE=metadata")',
             'print("APK_VERIFY_STAGE=toolset")',
             'print("APK_VERIFY_STAGE=badging")',
+            'print("APK_VERIFY_STAGE=signature-tool")',
             'print("APK_VERIFY_STAGE=signature")',
             'print("APK_VERIFY_STAGE=identity")',
             'print("APK_VERIFY_STAGE=alignment")',
