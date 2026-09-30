@@ -8,7 +8,6 @@ import json
 import os
 from pathlib import Path
 import re
-import secrets
 import subprocess
 import tempfile
 from threading import Lock
@@ -50,6 +49,10 @@ class RequestTransport(Protocol):
     def __call__(self, method: str, url: str, headers: dict[str, str], body: bytes | None) -> tuple[int, bytes]: ...
 
 
+class UploadTransport(Protocol):
+    def __call__(self, url: str, token: str, apk_path: Path) -> tuple[int, bytes]: ...
+
+
 class SignatureProvider(Protocol):
     def __call__(self, message: bytes, der_key: bytes) -> bytes: ...
 
@@ -86,6 +89,32 @@ def http_request(method: str, url: str, headers: dict[str, str], body: bytes | N
     except HTTPError as error:
         with error:
             return error.code, error.read()
+
+
+def curl_upload(url: str, token: str, apk_path: Path) -> tuple[int, bytes]:
+    """Use RuStore's documented curl multipart form without redirects or retries."""
+    try:
+        result = subprocess.run(
+            [
+                "curl", "--silent", "--show-error", "--request", "POST",
+                "--proto", "=https", "--max-redirs", "0",
+                "--connect-timeout", "30", "--max-time", "600",
+                "--url", url,
+                "--header", f"Public-Token: {token}",
+                "--form", f"file=@{apk_path}",
+                "--write-out", "\n%{http_code}",
+            ],
+            input=None, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            check=False, timeout=630,
+        )
+        if result.returncode != 0:
+            raise OSError
+        raw, separator, status = result.stdout.rpartition(b"\n")
+        if separator != b"\n" or re.fullmatch(rb"[1-5][0-9]{2}", status) is None:
+            raise OSError
+        return int(status), raw
+    except Exception:
+        raise RustoreApiError("RuStore upload: transport failed") from None
 
 
 def openssl_sign(message: bytes, der_key: bytes) -> bytes:
@@ -216,7 +245,7 @@ def _page(value: object, package_name: str) -> _Page:
 class RustoreApiClient:
     def __init__(self, *, key_id: str, private_key_pkcs8_base64: str,
                  request: RequestTransport = http_request, sign: SignatureProvider = openssl_sign,
-                 now: Clock = _utc_now) -> None:
+                 now: Clock = _utc_now, upload: UploadTransport = curl_upload) -> None:
         try:
             key_id = _text(key_id)
             der_key = base64.b64decode(private_key_pkcs8_base64, validate=True)
@@ -226,6 +255,7 @@ class RustoreApiClient:
             raise RustoreApiError("RuStore auth: invalid credentials") from None
         self._credentials = _Credentials(key_id, der_key)
         self._request = request
+        self._upload = upload
         self._sign = sign
         self._now = now
         self._token: _Token | None = None
@@ -242,9 +272,9 @@ class RustoreApiClient:
 
     def _exchange(self, method: str, url: str, headers: dict[str, str], body: bytes | None,
                   *, operation: str, mutating: bool = False, version_id: int | None = None,
-                  acknowledgement: bool = False) -> object:
+                  acknowledgement: bool = False, request: RequestTransport | None = None) -> object:
         try:
-            status, raw = self._request(method, url, headers, body)
+            status, raw = (request or self._request)(method, url, headers, body)
         except Exception:
             if mutating:
                 raise RustoreMutationUnresolved(operation, version_id) from None
@@ -367,19 +397,20 @@ class RustoreApiClient:
         _integer(version_id)
         path = self._path(package_name, version_id)
         try:
-            if apk_path.suffix.lower() != ".apk":
-                raise ValueError
-            apk = apk_path.read_bytes()
-            if not apk:
+            if apk_path.suffix.lower() != ".apk" or not apk_path.is_file() or apk_path.stat().st_size <= 0:
                 raise ValueError
         except Exception:
             raise RustoreApiError("RuStore upload: APK unreadable or invalid") from None
-        boundary = "rustore-" + secrets.token_hex(24)
-        body = (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="driver.apk"\r\n'
-                'Content-Type: application/vnd.android.package-archive\r\n\r\n').encode("ascii")
-        body += apk + f"\r\n--{boundary}--\r\n".encode("ascii")
-        self._post(path + "/apk?isMainApk=true&servicesType=Unknown", operation="upload", version_id=version_id,
-                   body=body, content_type=f"multipart/form-data; boundary={boundary}", acknowledgement=True)
+        url = path + "/apk?isMainApk=true&servicesType=Unknown"
+        token = self._authenticate()
+
+        def upload(method: str, requested_url: str, headers: dict[str, str], body: bytes | None) -> tuple[int, bytes]:
+            if method != "POST" or requested_url != url or body is not None or headers != {"Public-Token": token}:
+                raise RustoreApiError("RuStore upload: invalid request")
+            return self._upload(requested_url, token, apk_path)
+
+        self._exchange("POST", url, {"Public-Token": token}, None, operation="upload", mutating=True,
+                       version_id=version_id, acknowledgement=True, request=upload)
 
     def commit_for_moderation(self, package_name: str, version_id: int) -> None:
         _integer(version_id)
