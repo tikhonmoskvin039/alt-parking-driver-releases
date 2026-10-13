@@ -557,6 +557,13 @@ jobs:
           channel: stable
           cache: false
 
+      - name: Resolve Flutter dependencies
+        working-directory: source
+        shell: pwsh
+        run: |
+          flutter pub get
+          if ($LASTEXITCODE -ne 0) { throw 'Flutter dependency resolution failed' }
+
       - name: Verify runner OpenSSL
         shell: pwsh
         run: |
