@@ -83,6 +83,31 @@ class ProductionReleaseWorkflowTest(unittest.TestCase):
         self.assertEqual(self.workflow.count("java-version: '21'"), 1)
         self.assertNotIn("java-version: '17'", self.workflow)
 
+    def test_flutter_dependencies_resolve_before_production_secrets_and_build(self) -> None:
+        build = self.workflow.split("\n  build:\n", 1)[1].split("\n  publish:\n", 1)[0]
+        setup = "      - uses: subosito/flutter-action@"
+        resolve = (
+            "      - name: Resolve Flutter dependencies\n"
+            "        working-directory: source\n"
+            "        shell: pwsh\n"
+            "        run: |\n"
+            "          flutter pub get\n"
+            "          if ($LASTEXITCODE -ne 0) { throw 'Flutter dependency resolution failed' }"
+        )
+        secrets = "      - name: Prepare exclusive temporary production configuration and signing"
+        wrapper = "      - name: Build through authoritative production wrapper"
+
+        self.assertEqual(build.count("flutter pub get"), 1)
+        self.assertIn(resolve, build)
+        self.assertIn('source / ".env.driver-prod.json"', self.workflow)
+        self.assertIn('source / "android/key.properties"', self.workflow)
+        self.assertLess(build.index(setup), build.index(resolve))
+        self.assertLess(build.index(resolve), build.index(secrets))
+        secret_step = build[build.index(secrets) : build.index(wrapper)]
+        self.assertIn("POLICY_OPERATION: configure", secret_step)
+        self.assertIn("secrets.ANDROID_KEYSTORE_BASE64", secret_step)
+        self.assertLess(build.index(secrets), build.index(wrapper))
+
     def test_all_driver_release_mutations_share_one_workflow_lock(self) -> None:
         # History checks and writes must share the lock even when tag, SHA and
         # mode differ: two candidates must never validate against the same tip.
