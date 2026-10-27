@@ -79,6 +79,27 @@ class ProductionReleaseWorkflowTest(unittest.TestCase):
         self.assertIn("openssl version", self.workflow)
         self.assertIn("Git/usr/bin", self.workflow)
 
+    def test_rustore_push_project_id_uses_runner_masked_secret_at_build_boundary(self) -> None:
+        # GitHub prints step env before running the wrapper. Only a secret
+        # context value is masked at that boundary; a vars/literal value leaks.
+        build_step = self.workflow.split(
+            "      - name: Build through authoritative production wrapper\n", 1
+        )[1].split("\n      - ", 1)[0]
+        expected = "${{ secrets.RUSTORE_PUSH_PROJECT_ID }}"
+        bindings = re.findall(
+            r"(?m)^\s+RUSTORE_PUSH_PROJECT_ID:\s*([^\n]+)$", self.workflow
+        )
+        self.assertEqual(bindings, [expected])
+        self.assertIn(f"RUSTORE_PUSH_PROJECT_ID: {expected}", build_step)
+        references = re.findall(
+            r"\$\{\{\s*([^{}\n]*RUSTORE_PUSH_PROJECT_ID[^{}\n]*)\}\}",
+            self.workflow,
+        )
+        self.assertEqual(
+            [reference.strip() for reference in references],
+            ["secrets.RUSTORE_PUSH_PROJECT_ID"],
+        )
+
     def test_windows_build_uses_mapkit_compatible_java(self) -> None:
         self.assertEqual(self.workflow.count("java-version: '21'"), 1)
         self.assertNotIn("java-version: '17'", self.workflow)
