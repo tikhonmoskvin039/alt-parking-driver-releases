@@ -603,6 +603,8 @@ jobs:
       - name: Build through authoritative production wrapper
         working-directory: source
         shell: pwsh
+        env:
+          RUSTORE_PUSH_PROJECT_ID: ${{ secrets.RUSTORE_PUSH_PROJECT_ID }}
         run: |
           pwsh -File tool/build_android_prod_release.ps1 -ConfigPath .env.driver-prod.json
           if ($LASTEXITCODE -ne 0) { throw 'Production wrapper failed' }
