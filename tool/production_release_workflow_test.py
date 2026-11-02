@@ -802,11 +802,21 @@ class ProductionReleaseWorkflowTest(unittest.TestCase):
     def test_production_config_has_exact_keys_and_rejects_empty_without_values(self) -> None:
         keys = {"APP_ENV", "API_BASE_URL", "WS_BASE_URL", "FIREBASE_API_KEY", "FIREBASE_APP_ID",
                 "FIREBASE_MESSAGING_SENDER_ID", "FIREBASE_PROJECT_ID", "YANDEX_MAPKIT_API_KEY",
+                "YANDEX_LOGIN_CLIENT_ID",
                 "MAP_FALLBACK_LATITUDE", "MAP_FALLBACK_LONGITUDE", "SUPPORT_PHONE", "OAUTH_RETURN_URI"}
         self.assertEqual(set(self.call("production_config", {key: "synthetic" for key in keys})), keys)
         with self.assertRaises(RuntimeError) as raised:
             self.call("production_config", {key: "SECRET_VALUE" for key in keys - {"APP_ENV"}})
         self.assertNotIn("SECRET_VALUE", str(raised.exception))
+
+    def test_yandex_login_client_id_uses_production_secret(self) -> None:
+        prepare = self.workflow.split(
+            "      - name: Prepare exclusive temporary production configuration and signing\n", 1
+        )[1].split("\n      - ", 1)[0]
+        self.assertEqual(
+            re.findall(r"(?m)^          YANDEX_LOGIN_CLIENT_ID: ([^\n]+)$", prepare),
+            ["${{ secrets.YANDEX_LOGIN_CLIENT_ID }}"],
+        )
 
     def test_isolated_immutable_policy_uses_admin_read_token_only_on_stdin(self) -> None:
         self.assertIn("\n  immutable-policy:\n", self.workflow)
