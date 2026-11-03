@@ -162,7 +162,36 @@ class RustoreInspectTest(unittest.TestCase):
             result = rustore_inspect.main(["--version-id", str(VERSION_ID), "--status-v1"])
         self.assertEqual(result, 1)
         self.assertEqual(output.getvalue(), "")
+        self.assertEqual(errors.getvalue(), "RUSTORE_INSPECT_V1_IDENTITY_MISMATCH\n")
         self.assertNotIn("never-log-this", errors.getvalue())
+
+    def test_v1_status_shape_categories_hide_untrusted_fields(self) -> None:
+        row = {"versionId": VERSION_ID, "versionStatus": "DRAFT",
+               "versionName": None, "versionCode": None, "partialValue": 100,
+               "private": "never-log-this"}
+        page = {"content": [row], "pageNumber": 0, "pageSize": 20,
+                "totalElements": 1, "totalPages": 1, "private": "never-log-this"}
+        cases: list[tuple[object, str]] = [
+            ([], "PAGE_OBJECT_INVALID"),
+            ({key: value for key, value in page.items() if key != "content"}, "CONTENT_MISSING"),
+            ({**page, "content": "never-log-this"}, "CONTENT_NOT_LIST"),
+            ({**page, "content": []}, "ROW_COUNT_INVALID"),
+            ({**page, "content": ["never-log-this"]}, "ROW_OBJECT_INVALID"),
+            ({**page, "pageSize": 0}, "PAGE_METADATA_INVALID"),
+            ({**page, "content": [{**row, "versionStatus": "never-log-this"}]}, "VERSION_STATUS_INVALID"),
+            ({**page, "content": [{**row, "versionName": "never-log-this\n"}]}, "VERSION_NAME_INVALID"),
+            ({**page, "content": [{**row, "versionCode": "never-log-this"}]}, "VERSION_CODE_INVALID"),
+            ({**page, "content": [{**row, "partialValue": "never-log-this"}]}, "PARTIAL_VALUE_INVALID"),
+        ]
+        for response, category in cases:
+            with self.subTest(category=category), patch.object(rustore_inspect, "RustoreApiClient") as factory, \
+                    redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+                factory.return_value._get.return_value = response
+                result = rustore_inspect.main(["--version-id", str(VERSION_ID), "--status-v1"])
+                self.assertEqual(result, 1)
+                self.assertEqual(output.getvalue(), "")
+                self.assertEqual(errors.getvalue(), f"RUSTORE_INSPECT_V1_{category}\n")
+                self.assertNotIn("never-log-this", errors.getvalue())
 
     def test_v1_status_http_failure_hides_response_and_token(self) -> None:
         secret = "never-log-http-body-or-token"

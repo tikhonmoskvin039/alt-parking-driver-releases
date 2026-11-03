@@ -19,6 +19,10 @@ DETAIL_URL = (
 STATUS_URL = BASE + f"/public/v1/application/{PACKAGE}/version?ids={VERSION_ID}"
 
 
+class _StatusShapeError(Exception):
+    """A fixed diagnostic category; never contains RuStore response data."""
+
+
 class _ReadOnlyTransport:
     """Allow only the existing auth exchange and one fixed GET."""
 
@@ -126,25 +130,55 @@ def inspect_status_v1(client: RustoreApiClient, version_id: int) -> dict[str, ob
     """GET one v1 status row without parsing the draft through release constraints."""
     if type(version_id) is not int or version_id != VERSION_ID:
         raise ValueError("Unexpected RuStore version ID")
-    page = _mapping(client._get(STATUS_URL))
-    content = page.get("content")
-    if not isinstance(content, list) or len(content) != 1:
-        raise ValueError("Invalid version status page")
-    row = _mapping(content[0])
+    response = client._get(STATUS_URL)
+    try:
+        page = _mapping(response)
+    except ValueError:
+        raise _StatusShapeError("RUSTORE_INSPECT_V1_PAGE_OBJECT_INVALID") from None
+    if "content" not in page:
+        raise _StatusShapeError("RUSTORE_INSPECT_V1_CONTENT_MISSING")
+    content = page["content"]
+    if not isinstance(content, list):
+        raise _StatusShapeError("RUSTORE_INSPECT_V1_CONTENT_NOT_LIST")
+    if len(content) != 1:
+        raise _StatusShapeError("RUSTORE_INSPECT_V1_ROW_COUNT_INVALID")
+    try:
+        row = _mapping(content[0])
+    except ValueError:
+        raise _StatusShapeError("RUSTORE_INSPECT_V1_ROW_OBJECT_INVALID") from None
     if type(row.get("versionId")) is not int or row["versionId"] != version_id:
-        raise ValueError("Invalid version identity")
-    metadata = {
-        "pageNumber": _bounded_integer(page.get("pageNumber"), 0, 0),
-        "pageSize": _bounded_integer(page.get("pageSize"), 1, 100),
-        "totalElements": _bounded_integer(page.get("totalElements"), 1, 1),
-        "totalPages": _bounded_integer(page.get("totalPages"), 1, 1),
-    }
+        raise _StatusShapeError("RUSTORE_INSPECT_V1_IDENTITY_MISMATCH")
+    try:
+        metadata = {
+            "pageNumber": _bounded_integer(page.get("pageNumber"), 0, 0),
+            "pageSize": _bounded_integer(page.get("pageSize"), 1, 100),
+            "totalElements": _bounded_integer(page.get("totalElements"), 1, 1),
+            "totalPages": _bounded_integer(page.get("totalPages"), 1, 1),
+        }
+    except ValueError:
+        raise _StatusShapeError("RUSTORE_INSPECT_V1_PAGE_METADATA_INVALID") from None
+    try:
+        status = _safe_text(row.get("versionStatus"), r"[A-Z][A-Z0-9_]{0,40}")
+    except ValueError:
+        raise _StatusShapeError("RUSTORE_INSPECT_V1_VERSION_STATUS_INVALID") from None
+    try:
+        name = _safe_text(row.get("versionName"), r"[A-Za-z0-9._+-]{0,64}", optional=True)
+    except ValueError:
+        raise _StatusShapeError("RUSTORE_INSPECT_V1_VERSION_NAME_INVALID") from None
+    try:
+        code = _bounded_integer(row.get("versionCode"), 0, 2147483647, optional=True)
+    except ValueError:
+        raise _StatusShapeError("RUSTORE_INSPECT_V1_VERSION_CODE_INVALID") from None
+    try:
+        percentage = _bounded_integer(row.get("partialValue"), -1, 100, optional=True)
+    except ValueError:
+        raise _StatusShapeError("RUSTORE_INSPECT_V1_PARTIAL_VALUE_INVALID") from None
     return {
         "versionId": version_id,
-        "versionStatus": _safe_text(row.get("versionStatus"), r"[A-Z][A-Z0-9_]{0,40}"),
-        "versionName": _safe_text(row.get("versionName"), r"[A-Za-z0-9._+-]{0,64}", optional=True),
-        "versionCode": _bounded_integer(row.get("versionCode"), 0, 2147483647, optional=True),
-        "partialValue": _bounded_integer(row.get("partialValue"), -1, 100, optional=True),
+        "versionStatus": status,
+        "versionName": name,
+        "versionCode": code,
+        "partialValue": percentage,
         "page": metadata,
     }
 
@@ -167,6 +201,9 @@ def main(argv: list[str] | None = None) -> int:
         summary = inspect_status_v1(client, VERSION_ID) if arguments.status_v1 else inspect_version(client, VERSION_ID)
     except RustoreApiError as error:
         print(_error_category(error, transport), file=sys.stderr)
+        return 1
+    except _StatusShapeError as error:
+        print(str(error), file=sys.stderr)
         return 1
     except Exception:
         print("RuStore inspection failed", file=sys.stderr)
