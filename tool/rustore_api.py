@@ -38,8 +38,8 @@ class RustoreMutationUnresolved(RustoreApiError):
 class RustoreVersion:
     version_id: int
     package_name: str
-    version_name: str
-    version_code: int
+    version_name: str | None
+    version_code: int | None
     status: str
     publish_type: str
     partial_value: int
@@ -202,12 +202,18 @@ def _version(value: object, package_name: str) -> RustoreVersion:
     status = _enum_text(item.get("versionStatus"))
     if item.get("status", status) != status:
         raise RustoreApiError("RuStore: contradictory status")
-    partial_value = _integer(item.get("partialValue"), 0)
+    partial_value = _integer(item.get("partialValue"), -1)
     if partial_value > 100:
         raise RustoreApiError("RuStore: invalid rollout percentage")
+    if partial_value == -1:
+        partial_value = 100
+    name = item.get("versionName")
+    code = item.get("versionCode")
+    unassigned_code = code is None or (type(code) is int and code == -1)
     return RustoreVersion(
         version_id=_integer(item.get("versionId")), package_name=package_name,
-        version_name=_text(item.get("versionName")), version_code=_integer(item.get("versionCode")),
+        version_name=None if status == "DRAFT" and name is None else _text(name),
+        version_code=None if status == "DRAFT" and unassigned_code else _integer(code),
         status=status, publish_type=_enum_text(item.get("publishType")), partial_value=partial_value,
     )
 
