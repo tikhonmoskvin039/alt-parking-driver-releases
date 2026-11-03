@@ -41,11 +41,12 @@ def response(body: object, *, code: str = "OK") -> bytes:
     return json.dumps({"code": code, "message": None, "body": body, "timestamp": "2026-09-23T10:11:12.000+00:00"}).encode("utf-8")
 
 
-def page(items: list[dict[str, object]], *, number: int = 0, total_pages: int = 1, total_elements: int | None = None) -> bytes:
+def page(items: list[dict[str, object]], *, number: int = 0, size: int = 1,
+         total_pages: int = 1, total_elements: int | None = None) -> bytes:
     return response({
         "content": items,
         "pageNumber": number,
-        "pageSize": 1,
+        "pageSize": size,
         "totalElements": len(items) if total_elements is None else total_elements,
         "totalPages": total_pages,
     })
@@ -103,15 +104,40 @@ class RustoreApiContractTest(unittest.TestCase):
         bodies = [b'[]', b'{"code":"OK","code":"OK","body":{}}',
                   b'{"code":"OK","body":NaN}', response({}, code="ERROR")]
         for field, value in (("versionId", True), ("versionCode", "17"),
-                             ("versionName", ""), ("versionStatus", ""),
+                             ("versionCode", None), ("versionCode", -1),
+                             ("versionName", ""),
+                             ("versionName", None), ("versionStatus", ""),
                              ("publishType", None), ("partialValue", True),
-                             ("partialValue", 101), ("packageName", "ru.altparking.guard")):
+                             ("partialValue", -2), ("partialValue", 101),
+                             ("packageName", "ru.altparking.guard")):
             item = version(31)
             item[field] = value
             bodies.append(page([item]))
         for body in bodies:
             with self.subTest(body=body), self.assertRaises(RustoreApiError):
                 client(RecordingTransport(AUTH, (200, body)), []).list_versions(PACKAGE)
+
+    def test_unfilled_draft_metadata_is_accepted_before_apk_upload(self) -> None:
+        for unassigned_code in (None, -1):
+            with self.subTest(version_code=unassigned_code):
+                draft = version(31, "DRAFT")
+                draft["versionName"] = None
+                draft["versionCode"] = unassigned_code
+                transport = RecordingTransport(AUTH, (200, page([draft], size=20)))
+
+                observed = client(transport, []).get_version(PACKAGE, 31)
+
+                self.assertEqual((observed.version_id, observed.status), (31, "DRAFT"))
+                self.assertIsNone(observed.version_name)
+                self.assertIsNone(observed.version_code)
+                self.assertEqual(observed.partial_value, 100)
+                self.assertEqual(len(transport.requests), 2)
+
+    def test_full_rollout_sentinel_normalizes_to_one_hundred_percent(self) -> None:
+        active = version(31)
+        active["partialValue"] = -1
+        observed = client(RecordingTransport(AUTH, (200, page([active]))), []).get_version(PACKAGE, 31)
+        self.assertEqual(observed.partial_value, 100)
 
     def test_inconsistent_pagination_and_filter_mismatch_are_rejected(self) -> None:
         for body in (page([version(31)], number=1),
