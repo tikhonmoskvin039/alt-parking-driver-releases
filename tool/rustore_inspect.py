@@ -16,18 +16,22 @@ DETAIL_URL = (
     BASE + "/public/v2/application/"
     f"{PACKAGE}/version/{VERSION_ID}"
 )
+STATUS_URL = BASE + f"/public/v1/application/{PACKAGE}/version?ids={VERSION_ID}"
 
 
 class _ReadOnlyTransport:
-    """Allow only the existing auth exchange and one fixed detail GET."""
+    """Allow only the existing auth exchange and one fixed GET."""
 
-    def __init__(self) -> None:
+    def __init__(self, target_url: str = DETAIL_URL) -> None:
+        if target_url not in (DETAIL_URL, STATUS_URL):
+            raise ValueError("Unexpected RuStore inspection URL")
+        self.target_url = target_url
         self.detail_http_status: int | None = None
 
     def __call__(self, method: str, url: str, headers: dict[str, str], body: bytes | None) -> tuple[int, bytes]:
         if method == "POST" and url == BASE + "/public/auth/" and set(headers) == {"Content-Type"}:
             return http_request(method, url, headers, body)
-        if method == "GET" and url == DETAIL_URL and set(headers) == {"Public-Token"} and body is None:
+        if method == "GET" and url == self.target_url and set(headers) == {"Public-Token"} and body is None:
             status, raw = http_request(method, url, headers, body)
             if type(status) is int and 100 <= status <= 599:
                 self.detail_http_status = status
@@ -38,16 +42,17 @@ class _ReadOnlyTransport:
 def _error_category(error: RustoreApiError, transport: _ReadOnlyTransport) -> str:
     """Map audited client errors to fixed log markers; never print API text."""
     message = str(error)
+    scope = "STATUS" if transport.target_url == STATUS_URL else "DETAIL"
     if message.startswith("RuStore auth:"):
         return "RUSTORE_INSPECT_AUTH_FAILURE"
     if message == "RuStore query: HTTP failure" and transport.detail_http_status is not None:
-        return f"RUSTORE_INSPECT_DETAIL_HTTP_{transport.detail_http_status}"
+        return f"RUSTORE_INSPECT_{scope}_HTTP_{transport.detail_http_status}"
     if message == "RuStore query: transport failed":
-        return "RUSTORE_INSPECT_DETAIL_TRANSPORT_FAILURE"
+        return f"RUSTORE_INSPECT_{scope}_TRANSPORT_FAILURE"
     if message == "RuStore query: unsuccessful response":
-        return "RUSTORE_INSPECT_DETAIL_API_REJECTED"
+        return f"RUSTORE_INSPECT_{scope}_API_REJECTED"
     if message in {"RuStore query: invalid or unsuccessful response", "RuStore query: invalid response body"}:
-        return "RUSTORE_INSPECT_DETAIL_RESPONSE_INVALID"
+        return f"RUSTORE_INSPECT_{scope}_RESPONSE_INVALID"
     return "RUSTORE_INSPECT_API_FAILURE"
 
 
@@ -62,6 +67,14 @@ def _positive_integer(value: object, *, optional: bool = False) -> int | None:
         return None
     if type(value) is not int or value <= 0:
         raise ValueError("Invalid version detail")
+    return value
+
+
+def _bounded_integer(value: object, minimum: int, maximum: int, *, optional: bool = False) -> int | None:
+    if optional and value is None:
+        return None
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise ValueError("Invalid version status")
     return value
 
 
@@ -109,21 +122,49 @@ def inspect_version(client: RustoreApiClient, version_id: int) -> dict[str, obje
     }
 
 
+def inspect_status_v1(client: RustoreApiClient, version_id: int) -> dict[str, object]:
+    """GET one v1 status row without parsing the draft through release constraints."""
+    if type(version_id) is not int or version_id != VERSION_ID:
+        raise ValueError("Unexpected RuStore version ID")
+    page = _mapping(client._get(STATUS_URL))
+    content = page.get("content")
+    if not isinstance(content, list) or len(content) != 1:
+        raise ValueError("Invalid version status page")
+    row = _mapping(content[0])
+    if type(row.get("versionId")) is not int or row["versionId"] != version_id:
+        raise ValueError("Invalid version identity")
+    metadata = {
+        "pageNumber": _bounded_integer(page.get("pageNumber"), 0, 0),
+        "pageSize": _bounded_integer(page.get("pageSize"), 1, 100),
+        "totalElements": _bounded_integer(page.get("totalElements"), 1, 1),
+        "totalPages": _bounded_integer(page.get("totalPages"), 1, 1),
+    }
+    return {
+        "versionId": version_id,
+        "versionStatus": _safe_text(row.get("versionStatus"), r"[A-Z][A-Z0-9_]{0,40}"),
+        "versionName": _safe_text(row.get("versionName"), r"[A-Za-z0-9._+-]{0,64}", optional=True),
+        "versionCode": _bounded_integer(row.get("versionCode"), 0, 2147483647, optional=True),
+        "partialValue": _bounded_integer(row.get("partialValue"), -1, 100, optional=True),
+        "page": metadata,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Inspect one RuStore Driver draft without mutating it")
     parser.add_argument("--version-id", required=True)
+    parser.add_argument("--status-v1", action="store_true")
     arguments = parser.parse_args(argv)
     if arguments.version_id != str(VERSION_ID):
         print("Unexpected RuStore version ID", file=sys.stderr)
         return 2
-    transport = _ReadOnlyTransport()
+    transport = _ReadOnlyTransport(STATUS_URL if arguments.status_v1 else DETAIL_URL)
     try:
         client = RustoreApiClient(
             key_id=os.environ.get("RUSTORE_SUBMIT_KEY_ID", ""),
             private_key_pkcs8_base64=os.environ.get("RUSTORE_SUBMIT_PRIVATE_KEY_PKCS8_BASE64", ""),
             request=transport,
         )
-        summary = inspect_version(client, VERSION_ID)
+        summary = inspect_status_v1(client, VERSION_ID) if arguments.status_v1 else inspect_version(client, VERSION_ID)
     except RustoreApiError as error:
         print(_error_category(error, transport), file=sys.stderr)
         return 1

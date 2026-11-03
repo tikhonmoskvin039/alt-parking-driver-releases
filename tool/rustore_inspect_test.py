@@ -36,6 +36,7 @@ class RustoreInspectTest(unittest.TestCase):
         self.assertEqual(text.count("secrets.RUSTORE_SUBMIT_PRIVATE_KEY_PKCS8_BASE64"), 1)
         self.assertNotIn("secrets.RUSTORE_PUBLISH", text)
         self.assertIn("python -m tool.rustore_inspect --version-id", text)
+        self.assertIn("--status-v1", text)
         self.assertEqual(re.findall(r"uses: ([^\s]+)", text), [
             "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
         ])
@@ -108,6 +109,85 @@ class RustoreInspectTest(unittest.TestCase):
         self.assertEqual(result, 2)
         self.assertEqual(output.getvalue(), "")
         client.assert_not_called()
+
+    def test_v1_status_reads_only_exact_id_and_redacts_response(self) -> None:
+        secret = "never-log-private-fields-or-token"
+        calls: list[tuple[str, str]] = []
+        status_url = f"{BASE}/public/v1/application/ru.altparking.driver/version?ids={VERSION_ID}"
+
+        def request(method: str, url: str, headers: dict[str, str], body: bytes | None) -> tuple[int, bytes]:
+            calls.append((method, url))
+            if method == "POST" and url == BASE + "/public/auth/":
+                return 200, json.dumps({"code": "OK", "body": {"jwe": secret, "ttl": 900}}).encode()
+            self.assertEqual((method, url), ("GET", status_url))
+            self.assertEqual(headers, {"Public-Token": secret})
+            self.assertIsNone(body)
+            return 200, json.dumps({"code": "OK", "body": {
+                "content": [{"versionId": VERSION_ID, "versionStatus": "DRAFT",
+                             "versionName": None, "versionCode": None, "partialValue": -1,
+                             "privateField": secret}],
+                "pageNumber": 0, "pageSize": 20, "totalElements": 1, "totalPages": 1,
+                "privatePageField": secret,
+            }}).encode()
+
+        def client_factory(**kwargs: object) -> RustoreApiClient:
+            return RustoreApiClient(**kwargs, sign=lambda message, key: b"signature")
+
+        with patch.object(rustore_inspect, "http_request", side_effect=request), \
+                patch.object(rustore_inspect, "RustoreApiClient", side_effect=client_factory), \
+                patch.dict(os.environ, {
+                    "RUSTORE_SUBMIT_KEY_ID": "private-key-id",
+                    "RUSTORE_SUBMIT_PRIVATE_KEY_PKCS8_BASE64": base64.b64encode(b"private-key").decode(),
+                }), redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+            result = rustore_inspect.main(["--version-id", str(VERSION_ID), "--status-v1"])
+        self.assertEqual(result, 0)
+        self.assertEqual(calls, [("POST", BASE + "/public/auth/"), ("GET", status_url)])
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(json.loads(output.getvalue()), {
+            "versionId": VERSION_ID, "versionStatus": "DRAFT", "versionName": None,
+            "versionCode": None, "partialValue": -1,
+            "page": {"pageNumber": 0, "pageSize": 20, "totalElements": 1, "totalPages": 1},
+        })
+        self.assertNotIn(secret, output.getvalue())
+
+    def test_v1_status_rejects_other_identity_without_leaking_body(self) -> None:
+        with patch.object(rustore_inspect, "RustoreApiClient") as factory, \
+                redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+            factory.return_value._get.return_value = {
+                "content": [{"versionId": VERSION_ID + 1, "versionStatus": "DRAFT",
+                             "versionName": None, "versionCode": None, "partialValue": 100,
+                             "private": "never-log-this"}],
+                "pageNumber": 0, "pageSize": 20, "totalElements": 1, "totalPages": 1,
+            }
+            result = rustore_inspect.main(["--version-id", str(VERSION_ID), "--status-v1"])
+        self.assertEqual(result, 1)
+        self.assertEqual(output.getvalue(), "")
+        self.assertNotIn("never-log-this", errors.getvalue())
+
+    def test_v1_status_http_failure_hides_response_and_token(self) -> None:
+        secret = "never-log-http-body-or-token"
+        status_url = f"{BASE}/public/v1/application/ru.altparking.driver/version?ids={VERSION_ID}"
+
+        def request(method: str, url: str, headers: dict[str, str], body: bytes | None) -> tuple[int, bytes]:
+            if method == "POST" and url == BASE + "/public/auth/":
+                return 200, json.dumps({"code": "OK", "body": {"jwe": secret, "ttl": 900}}).encode()
+            self.assertEqual((method, url), ("GET", status_url))
+            return 403, json.dumps({"code": "error", "message": secret}).encode()
+
+        def client_factory(**kwargs: object) -> RustoreApiClient:
+            return RustoreApiClient(**kwargs, sign=lambda message, key: b"signature")
+
+        with patch.object(rustore_inspect, "http_request", side_effect=request), \
+                patch.object(rustore_inspect, "RustoreApiClient", side_effect=client_factory), \
+                patch.dict(os.environ, {
+                    "RUSTORE_SUBMIT_KEY_ID": "private-key-id",
+                    "RUSTORE_SUBMIT_PRIVATE_KEY_PKCS8_BASE64": base64.b64encode(b"private-key").decode(),
+                }), redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+            result = rustore_inspect.main(["--version-id", str(VERSION_ID), "--status-v1"])
+        self.assertEqual(result, 1)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(errors.getvalue(), "RUSTORE_INSPECT_STATUS_HTTP_403\n")
+        self.assertNotIn(secret, errors.getvalue())
 
     def test_invalid_response_fails_without_printing_raw_fields(self) -> None:
         response = {"versionId": VERSION_ID + 1, "versionStatus": "DRAFT", "private": "do-not-print"}
