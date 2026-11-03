@@ -166,7 +166,7 @@ def inspect_status_v1(client: RustoreApiClient, version_id: int) -> dict[str, ob
     except ValueError:
         raise _StatusShapeError("RUSTORE_INSPECT_V1_VERSION_NAME_INVALID") from None
     try:
-        code = _bounded_integer(row.get("versionCode"), 0, 2147483647, optional=True)
+        code = _bounded_integer(row.get("versionCode"), -2147483648, 2147483647, optional=True)
     except ValueError:
         raise _StatusShapeError("RUSTORE_INSPECT_V1_VERSION_CODE_INVALID") from None
     try:

@@ -165,6 +165,16 @@ class RustoreInspectTest(unittest.TestCase):
         self.assertEqual(errors.getvalue(), "RUSTORE_INSPECT_V1_IDENTITY_MISMATCH\n")
         self.assertNotIn("never-log-this", errors.getvalue())
 
+    def test_v1_status_reports_negative_one_draft_version_code(self) -> None:
+        with patch.object(rustore_inspect, "RustoreApiClient") as factory:
+            factory.return_value._get.return_value = {
+                "content": [{"versionId": VERSION_ID, "versionStatus": "DRAFT",
+                             "versionName": None, "versionCode": -1, "partialValue": 100}],
+                "pageNumber": 0, "pageSize": 20, "totalElements": 1, "totalPages": 1,
+            }
+            summary = rustore_inspect.inspect_status_v1(factory.return_value, VERSION_ID)
+        self.assertEqual(summary["versionCode"], -1)
+
     def test_v1_status_shape_categories_hide_untrusted_fields(self) -> None:
         row = {"versionId": VERSION_ID, "versionStatus": "DRAFT",
                "versionName": None, "versionCode": None, "partialValue": 100,
@@ -181,6 +191,7 @@ class RustoreInspectTest(unittest.TestCase):
             ({**page, "content": [{**row, "versionStatus": "never-log-this"}]}, "VERSION_STATUS_INVALID"),
             ({**page, "content": [{**row, "versionName": "never-log-this\n"}]}, "VERSION_NAME_INVALID"),
             ({**page, "content": [{**row, "versionCode": "never-log-this"}]}, "VERSION_CODE_INVALID"),
+            ({**page, "content": [{**row, "versionCode": -2147483649}]}, "VERSION_CODE_INVALID"),
             ({**page, "content": [{**row, "partialValue": "never-log-this"}]}, "PARTIAL_VALUE_INVALID"),
         ]
         for response, category in cases:
