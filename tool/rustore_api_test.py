@@ -332,18 +332,40 @@ class RustoreApiContractTest(unittest.TestCase):
         self.assertEqual(options["input"], None)
         self.assertEqual(transport.requests[1:], [])
 
-    def test_acknowledgement_endpoints_accept_only_absent_or_null_body(self) -> None:
+    def test_upload_accepts_documented_permissions_body_without_repeating_post(self) -> None:
+        upload_result = {
+            "permissions": {
+                "location": [{
+                    "permission": "android.permission.ACCESS_FINE_LOCATION",
+                    "description": "Location access",
+                }],
+            },
+            "autoDetectedSdks": {"analytics": ["com.google.firebase.analytics"]},
+        }
+        transport = RecordingTransport(AUTH, (200, response(upload_result)))
+        with tempfile.TemporaryDirectory() as directory:
+            apk = Path(directory) / "driver.apk"
+            apk.write_bytes(b"PK\x03\x04fixture-apk")
+            client(transport, []).upload_main_apk(PACKAGE, 42, apk)
+        self.assertEqual([request[0] for request in transport.requests], ["POST", "POST"])
+        self.assertEqual(len(transport.requests), 2)
+
+    def test_mutation_acknowledgements_reject_unexpected_body_types(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             apk = Path(directory) / "driver.apk"
             apk.write_bytes(b"abc")
             for operation in ("upload", "commit", "publish"):
-                for raw in (b'{"code":"OK"}', response(None)):
+                valid = (b'{"code":"OK"}', response(None))
+                if operation == "upload":
+                    valid += (response({}),)
+                for raw in valid:
                     with self.subTest(operation=operation, raw=raw):
                         transport = RecordingTransport(AUTH, (200, raw))
                         api = client(transport, [])
                         self.mutate(api, operation, apk)
                         self.assertEqual(len(transport.requests), 2)
-                for raw in (*(response(value) for value in ({}, [], 42, False, "unexpected")),
+                invalid = ([], 42, False, "unexpected") if operation == "upload" else ({}, [], 42, False, "unexpected")
+                for raw in (*(response(value) for value in invalid),
                             b'{"code":"OK","body":null,"body":null}'):
                     with self.subTest(operation=operation, invalid=raw):
                         transport = RecordingTransport(AUTH, (200, raw))
