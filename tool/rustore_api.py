@@ -298,7 +298,12 @@ class RustoreApiClient:
         if envelope["code"] != "OK":
             raise RustoreApiError(f"RuStore {operation}: unsuccessful response")
         result = envelope.get("body")
-        if (acknowledgement and result is not None) or (not acknowledgement and result is None):
+        if acknowledgement:
+            # Upload may return optional permissions and SDK metadata in an object.
+            invalid_body = result is not None and not (operation == "upload" and isinstance(result, dict))
+        else:
+            invalid_body = result is None
+        if invalid_body:
             if mutating:
                 raise RustoreMutationUnresolved(operation, version_id)
             raise RustoreApiError(f"RuStore {operation}: invalid response body")
