@@ -16,7 +16,7 @@ from tool.rustore_api import BASE, RustoreApiClient
 
 VERSION_ID = 2064928626
 DETAIL_URL = (
-    "https://public-api-m.rustore.ru/public/v2/application/"
+    BASE + "/public/v2/application/"
     f"ru.altparking.driver/version/{VERSION_ID}"
 )
 WORKFLOW = Path(__file__).resolve().parent.parent / ".github/workflows/rustore-inspect.yml"
@@ -120,6 +120,30 @@ class RustoreInspectTest(unittest.TestCase):
         self.assertEqual(output.getvalue(), "")
         self.assertNotIn("do-not-print", errors.getvalue())
         self.assertNotIn("private", errors.getvalue())
+
+    def test_detail_http_status_is_reported_without_response_or_token(self) -> None:
+        secret = "response-and-token-must-stay-private"
+
+        def request(method: str, url: str, headers: dict[str, str], body: bytes | None) -> tuple[int, bytes]:
+            if method == "POST" and url == BASE + "/public/auth/":
+                return 200, json.dumps({"code": "OK", "body": {"jwe": secret, "ttl": 900}}).encode()
+            self.assertEqual((method, url), ("GET", DETAIL_URL))
+            return 403, json.dumps({"code": "error", "message": secret}).encode()
+
+        def client_factory(**kwargs: object) -> RustoreApiClient:
+            return RustoreApiClient(**kwargs, sign=lambda message, key: b"signature")
+
+        with patch.object(rustore_inspect, "http_request", side_effect=request), \
+                patch.object(rustore_inspect, "RustoreApiClient", side_effect=client_factory), \
+                patch.dict(os.environ, {
+                    "RUSTORE_SUBMIT_KEY_ID": "private-key-id",
+                    "RUSTORE_SUBMIT_PRIVATE_KEY_PKCS8_BASE64": base64.b64encode(b"private-key").decode(),
+                }), redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+            result = rustore_inspect.main(["--version-id", str(VERSION_ID)])
+        self.assertEqual(result, 1)
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(errors.getvalue(), "RUSTORE_INSPECT_DETAIL_HTTP_403\n")
+        self.assertNotIn(secret, errors.getvalue())
 
 
 if __name__ == "__main__":

@@ -8,14 +8,47 @@ import re
 import sys
 from typing import cast
 
-from tool.rustore_api import PACKAGE, RustoreApiClient, RustoreApiError
+from tool.rustore_api import BASE, PACKAGE, RustoreApiClient, RustoreApiError, http_request
 
 
 VERSION_ID = 2064928626
 DETAIL_URL = (
-    "https://public-api-m.rustore.ru/public/v2/application/"
+    BASE + "/public/v2/application/"
     f"{PACKAGE}/version/{VERSION_ID}"
 )
+
+
+class _ReadOnlyTransport:
+    """Allow only the existing auth exchange and one fixed detail GET."""
+
+    def __init__(self) -> None:
+        self.detail_http_status: int | None = None
+
+    def __call__(self, method: str, url: str, headers: dict[str, str], body: bytes | None) -> tuple[int, bytes]:
+        if method == "POST" and url == BASE + "/public/auth/" and set(headers) == {"Content-Type"}:
+            return http_request(method, url, headers, body)
+        if method == "GET" and url == DETAIL_URL and set(headers) == {"Public-Token"} and body is None:
+            status, raw = http_request(method, url, headers, body)
+            if type(status) is int and 100 <= status <= 599:
+                self.detail_http_status = status
+            return status, raw
+        raise RustoreApiError("Unexpected RuStore inspection request")
+
+
+def _error_category(error: RustoreApiError, transport: _ReadOnlyTransport) -> str:
+    """Map audited client errors to fixed log markers; never print API text."""
+    message = str(error)
+    if message.startswith("RuStore auth:"):
+        return "RUSTORE_INSPECT_AUTH_FAILURE"
+    if message == "RuStore query: HTTP failure" and transport.detail_http_status is not None:
+        return f"RUSTORE_INSPECT_DETAIL_HTTP_{transport.detail_http_status}"
+    if message == "RuStore query: transport failed":
+        return "RUSTORE_INSPECT_DETAIL_TRANSPORT_FAILURE"
+    if message == "RuStore query: unsuccessful response":
+        return "RUSTORE_INSPECT_DETAIL_API_REJECTED"
+    if message in {"RuStore query: invalid or unsuccessful response", "RuStore query: invalid response body"}:
+        return "RUSTORE_INSPECT_DETAIL_RESPONSE_INVALID"
+    return "RUSTORE_INSPECT_API_FAILURE"
 
 
 def _mapping(value: object) -> dict[str, object]:
@@ -83,15 +116,16 @@ def main(argv: list[str] | None = None) -> int:
     if arguments.version_id != str(VERSION_ID):
         print("Unexpected RuStore version ID", file=sys.stderr)
         return 2
+    transport = _ReadOnlyTransport()
     try:
         client = RustoreApiClient(
             key_id=os.environ.get("RUSTORE_SUBMIT_KEY_ID", ""),
             private_key_pkcs8_base64=os.environ.get("RUSTORE_SUBMIT_PRIVATE_KEY_PKCS8_BASE64", ""),
+            request=transport,
         )
         summary = inspect_version(client, VERSION_ID)
     except RustoreApiError as error:
-        stage = "authentication" if str(error).startswith("RuStore auth:") else "detail query"
-        print(f"RuStore inspection {stage} failed", file=sys.stderr)
+        print(_error_category(error, transport), file=sys.stderr)
         return 1
     except Exception:
         print("RuStore inspection failed", file=sys.stderr)
